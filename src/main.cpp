@@ -32,7 +32,7 @@ void runStatements(minidb::Database& db, const std::string& text) {
   }
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
   std::string dataDir = "data";
