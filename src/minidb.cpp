@@ -1,4 +1,5 @@
 #include "minidb.hpp"
+#include "sqlexpr.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -10,10 +11,6 @@
 using namespace std;
 
 namespace minidb {
-
-// ---------------------------------------------------------------------------
-// Index methods
-// ---------------------------------------------------------------------------
 
 void Index::clear() {
   btree.clear();
@@ -68,9 +65,6 @@ set<size_t> Index::range(const string& op, const string& key) const {
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// String utilities
-// ---------------------------------------------------------------------------
 
 string trim(string text) {
   const char* ws = " \t\n\r\f\v";
@@ -201,9 +195,6 @@ bool isInteger(const string& value) {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Type / kind helpers
-// ---------------------------------------------------------------------------
 
 FieldType parseType(const string& text) {
   const auto u = upper(trim(text));
@@ -237,9 +228,6 @@ string joinTypeName(JoinType type) {
   return "INNER";
 }
 
-// ---------------------------------------------------------------------------
-// Storage encoding
-// ---------------------------------------------------------------------------
 
 string encode(const string& value) {
   string out;
@@ -293,7 +281,8 @@ vector<string> splitStatements(const string& input) {
   vector<string> out;
   string current;
   char quote = 0;
-  for (const char c : input) {
+  for (size_t i = 0; i < input.size(); ++i) {
+    const char c = input[i];
     if (quote) {
       current += c;
       if (c == quote) quote = 0;
@@ -302,6 +291,10 @@ vector<string> splitStatements(const string& input) {
     if (c == '\'' || c == '"') {
       quote = c;
       current += c;
+      continue;
+    }
+    if (c == '-' && i + 1 < input.size() && input[i + 1] == '-') {
+      while (i < input.size() && input[i] != '\n') ++i;  // skip to end of line
       continue;
     }
     if (c == ';') {
@@ -314,10 +307,6 @@ vector<string> splitStatements(const string& input) {
   if (!trim(current).empty()) out.push_back(trim(current));
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// Predicates / aggregates
-// ---------------------------------------------------------------------------
 
 vector<Predicate> parsePredicates(const string& text) {
   vector<Predicate> predicates;
@@ -410,16 +399,49 @@ size_t earliestJoinKeyword(const string& text) {
   return best;
 }
 
+string joinTokenSlice(const vector<Token>& toks, size_t begin, size_t end) {
+  string out;
+  for (size_t i = begin; i < end; ++i) {
+    if (i > begin &&
+        (toks[i].kind == TokKind::Identifier || toks[i].kind == TokKind::Number ||
+         toks[i].kind == TokKind::String || toks[i].kind == TokKind::Keyword ||
+         toks[i].kind == TokKind::Plus || toks[i].kind == TokKind::Minus ||
+         toks[i].kind == TokKind::Star || toks[i].kind == TokKind::Slash ||
+         toks[i].kind == TokKind::Eq || toks[i].kind == TokKind::Ne ||
+         toks[i].kind == TokKind::Lt || toks[i].kind == TokKind::Le ||
+         toks[i].kind == TokKind::Gt || toks[i].kind == TokKind::Ge ||
+         toks[i].kind == TokKind::LParen || toks[i].kind == TokKind::RParen ||
+         toks[i].kind == TokKind::Comma || toks[i].kind == TokKind::Dot)) {
+      out += ' ';
+    }
+    out += toks[i].text;
+  }
+  return trim(out);
+}
+
 pair<string, string> splitAlias(const string& text) {
   const string trimmed = trim(text);
-  const size_t asPos = findKeyword(trimmed, "AS");
-  if (asPos == string::npos) return {trimmed, ""};
+  if (trimmed.empty()) return {"", ""};
 
-  const string expr = trim(trimmed.substr(0, asPos));
-  const string aliasText = trim(trimmed.substr(asPos + 2));
+  const auto toks = lexSql(trimmed);
+  int depth = 0;
+  size_t asIndex = string::npos;
+  for (size_t i = 0; i < toks.size(); ++i) {
+    if (toks[i].kind == TokKind::LParen) ++depth;
+    else if (toks[i].kind == TokKind::RParen && depth > 0) --depth;
+    else if (depth == 0 && toks[i].kind == TokKind::Keyword && toks[i].text == "AS") {
+      asIndex = i;
+      break;
+    }
+  }
+  if (asIndex == string::npos || asIndex == 0 || asIndex + 1 >= toks.size()) {
+    return {trimmed, ""};
+  }
+
+  const string expr = joinTokenSlice(toks, 0, asIndex);
+  const string aliasText = joinTokenSlice(toks, asIndex + 1, toks.size() - 1);
   if (expr.empty() || aliasText.empty()) return {trimmed, ""};
-
-  return {expr, unquote(aliasText)};
+  return {expr, aliasText};
 }
 
 void splitQualified(const string& operand, string& tableOut, string& columnOut) {
@@ -521,7 +543,10 @@ SelectQuery parseSelectQuery(const string& sql, bool explainOnly) {
     for (const size_t p : {groupPos, orderPos, limitPos})
       if (p != string::npos && p > wherePos) end = min(end, p);
     const string whereText = trim(afterFrom.substr(wherePos + 5, end - (wherePos + 5)));
-    query.predicates = parsePredicates(whereText);
+    if (!whereText.empty()) {
+      query.whereExpr = parseExpression(whereText);
+      query.predicates = extractSargablePredicates(query.whereExpr);
+    }
   }
 
   // ORDER BY

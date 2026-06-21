@@ -10,6 +10,7 @@ add_executable(minisql
   src/minidb.cpp
   src/table.cpp
   src/database.cpp
+  src/sqlexpr.cpp
 )
 
 target_include_directories(minisql PRIVATE include)

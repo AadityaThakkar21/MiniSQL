@@ -1,4 +1,5 @@
 #include "minidb.hpp"
+#include "sqlexpr.hpp"
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -148,13 +149,18 @@ bool Table::matches(size_t rowId, const vector<Predicate>& predicates) const {
   return true;
 }
 
-QueryPlan Table::plan(const vector<Predicate>& predicates) const {
+QueryPlan Table::plan(const vector<Predicate>& predicates, const Expr* whereExpr) const {
   QueryPlan best;
   best.description = "PLAN: sequential scan";
 
   for (const auto& predicate : predicates) {
-    const int col = columnIndex(predicate.column);
-    if (col < 0) throw runtime_error("unknown column in WHERE: " + predicate.column);
+    // Predicates extracted from an expression may be table-qualified
+    // (e.g. "students.cgpa"); strip the qualifier for single-table lookup.
+    string columnName = predicate.column;
+    const auto dot = columnName.find('.');
+    if (dot != string::npos) columnName = columnName.substr(dot + 1);
+    const int col = columnIndex(columnName);
+    if (col < 0) continue;  // not a column of this table; the filter step handles it
     for (const auto& index : indexes_) {
       if (index.column != columns_[static_cast<size_t>(col)].name) continue;
       if (predicate.op != "=" && (index.kind != IndexKind::BTree || predicate.op == "!=")) continue;
@@ -179,7 +185,11 @@ QueryPlan Table::plan(const vector<Predicate>& predicates) const {
   vector<size_t> filtered;
   for (const auto rowId : best.candidateRowIds) {
     ++best.rowsExamined;
-    if (matches(rowId, predicates)) filtered.push_back(rowId);
+    // The expression (when present) is the authoritative filter; the sargable
+    // predicates above only narrow the candidate set via indexes.
+    const bool keep = whereExpr ? exprIsTrue(*whereExpr, columns_, rows_[rowId].value())
+                                : matches(rowId, predicates);
+    if (keep) filtered.push_back(rowId);
   }
   best.candidateRowIds = move(filtered);
   best.description += " | rows_examined=" + to_string(best.rowsExamined) +
@@ -229,7 +239,8 @@ string Table::aggregate(const SelectQuery& query, const vector<size_t>& rowIds,
 }
 
 string Table::select(const SelectQuery& query) const {
-  auto planned = plan(query.predicates);
+  if (query.whereExpr) validateExpr(*query.whereExpr, columns_);
+  auto planned = plan(query.predicates, query.whereExpr.get());
   if (query.explainOnly) return planned.description;
   if (query.aggregate.has_value()) {
     return aggregate(query, planned.candidateRowIds, planned.description);

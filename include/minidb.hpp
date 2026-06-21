@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -9,6 +10,8 @@
 #include <vector>
 
 namespace minidb {
+
+struct Expr;  // defined in sqlexpr.hpp; SelectQuery holds an optional WHERE tree
 
 enum class FieldType { Int, Text };
 enum class IndexKind { BTree, Hash };
@@ -54,6 +57,7 @@ struct SelectQuery {
   std::optional<std::size_t> limit;
   std::optional<Aggregate> aggregate;
   std::vector<JoinClause> joins;
+  std::shared_ptr<Expr> whereExpr;  // full WHERE expression tree (single-table SELECT)
   bool explainOnly = false;
 };
 
@@ -118,7 +122,7 @@ class Table {
   void removeFromIndexes(std::size_t rowId, const Row& row);
   void rebuildIndexes();
   bool matches(std::size_t rowId, const std::vector<Predicate>& predicates) const;
-  QueryPlan plan(const std::vector<Predicate>& predicates) const;
+  QueryPlan plan(const std::vector<Predicate>& predicates, const Expr* whereExpr = nullptr) const;
   std::string aggregate(const SelectQuery& query, const std::vector<std::size_t>& rows,
                         const std::string& planText) const;
 };
