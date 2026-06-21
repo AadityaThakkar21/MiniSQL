@@ -9,23 +9,6 @@ using namespace std;
 
 namespace minidb {
 
-// Forward declarations - implementations in minidb.cpp
-extern string lower(string text);
-extern string upper(string text);
-extern bool isInteger(const string& value);
-extern FieldType parseType(const string& text);
-extern string typeName(FieldType type);
-extern IndexKind parseIndexKind(const string& text);
-extern string indexKindName(IndexKind kind);
-extern string encode(const string& value);
-extern string decode(const string& value);
-extern vector<string> splitTsv(const string& line);
-extern vector<string> splitComma(const string& text);
-extern string unquote(string value);
-extern vector<Predicate> parsePredicates(const string& text);
-extern optional<Aggregate> parseAggregate(const vector<string>& projection);
-extern string formatRows(const vector<string>& headers, const vector<vector<string>>& rows, const string& plan);
-
 Table::Table(string name, vector<Column> columns)
     : tableName_(lower(move(name))), columns_(move(columns)) {
   for (auto& column : columns_) {
@@ -260,12 +243,14 @@ string Table::select(const SelectQuery& query) const {
       headers.push_back(columns_[i].name);
     }
   } else {
-    for (const auto& column : query.projection) {
+    for (size_t i = 0; i < query.projection.size(); ++i) {
+      const auto& column = query.projection[i];
       if (column.rfind("__table__", 0) == 0) continue;
       const int col = columnIndex(column);
       if (col < 0) throw runtime_error("unknown selected column: " + column);
       selectedColumns.push_back(col);
-      headers.push_back(columns_[static_cast<size_t>(col)].name);
+      const bool hasAlias = i < query.aliases.size() && !query.aliases[i].empty();
+      headers.push_back(hasAlias ? query.aliases[i] : columns_[static_cast<size_t>(col)].name);
     }
   }
 
@@ -444,4 +429,4 @@ Table Table::load(const filesystem::path& schemaPath) {
   return table;
 }
 
-} // namespace minidb
+}

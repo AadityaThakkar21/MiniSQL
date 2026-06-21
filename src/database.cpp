@@ -3,6 +3,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 
 using namespace std;
 
@@ -52,6 +53,7 @@ string Database::execute(const string& sql) {
   if (startsWithKeyword(clean, "SHOW TABLES")) return showTables();
   if (startsWithKeyword(clean, "DESCRIBE")) return describe(clean);
   if (startsWithKeyword(clean, "VACUUM")) return vacuum(clean);
+  if (startsWithKeyword(clean, "DROP TABLE")) return dropTable(clean);
   if (startsWithKeyword(clean, "CREATE TABLE")) return createTable(clean);
   if (startsWithKeyword(clean, "CREATE INDEX")) return createIndex(clean);
   if (startsWithKeyword(clean, "INSERT")) return insert(clean);
@@ -70,6 +72,14 @@ string Database::begin() {
 
 string Database::commit() {
   if (!inTransaction()) throw runtime_error("no active transaction");
+  // Remove on-disk files for any table that was dropped during the transaction.
+  for (const auto& [name, _] : transactionSnapshot_.value()) {
+    if (tables_.find(name) == tables_.end()) {
+      error_code ec;
+      filesystem::remove(dataDir_ / (name + ".schema"), ec);
+      filesystem::remove(dataDir_ / (name + ".rows"), ec);
+    }
+  }
   persistAll();
   transactionSnapshot_.reset();
   return "COMMIT";
@@ -131,6 +141,35 @@ string Database::createTable(const string& sql) {
   tables_.emplace(name, move(t));
   persistIfAutoCommit(name);
   return "CREATE TABLE";
+}
+
+string Database::dropTable(const string& sql) {
+  static const regex dropRegex(
+      R"(^DROP\s+TABLE\s+(IF\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)$)",
+      regex::icase);
+  smatch match;
+  if (!regex_match(sql, match, dropRegex)) {
+    throw runtime_error("syntax: DROP TABLE [IF EXISTS] name");
+  }
+  const bool ifExists = match[1].matched;
+  const auto name = lower(match[2].str());
+
+  const auto it = tables_.find(name);
+  if (it == tables_.end()) {
+    if (ifExists) return "DROP TABLE";  // no-op, table absent
+    throw runtime_error("unknown table: " + name);
+  }
+  tables_.erase(it);
+
+  // Outside a transaction, remove the backing files immediately. Inside a
+  // transaction the files are left until COMMIT (which cleans them up) so that
+  // ROLLBACK can restore the table from the in-memory snapshot.
+  if (!inTransaction()) {
+    error_code ec;
+    filesystem::remove(dataDir_ / (name + ".schema"), ec);
+    filesystem::remove(dataDir_ / (name + ".rows"), ec);
+  }
+  return "DROP TABLE";
 }
 
 string Database::createIndex(const string& sql) {
@@ -239,6 +278,82 @@ string Database::vacuum(const string& sql) {
   return message;
 }
 
+// Evaluate WHERE predicates against a joined row. leftRow/rightRow are null
+// when that side is the unmatched (NULL-extended) side of an outer join; any
+// predicate referencing a NULL side evaluates to false, mirroring SQL.
+static bool joinRowMatches(const vector<Predicate>& predicates,
+                           const Table& leftTable, const Table& rightTable,
+                           const vector<string>* leftRow,
+                           const vector<string>* rightRow) {
+  for (const auto& predicate : predicates) {
+    string qualifier;
+    string column = predicate.column;
+    const auto dot = column.find('.');
+    if (dot != string::npos) {
+      qualifier = column.substr(0, dot);
+      column = column.substr(dot + 1);
+    }
+
+    const Table* table = nullptr;
+    const vector<string>* row = nullptr;
+    int colIdx = -1;
+
+    auto bind = [&](const Table& t, const vector<string>* r) -> bool {
+      for (size_t i = 0; i < t.columns().size(); ++i) {
+        if (t.columns()[i].name == column) {
+          table = &t;
+          row = r;
+          colIdx = static_cast<int>(i);
+          return true;
+        }
+      }
+      return false;
+    };
+
+    if (!qualifier.empty()) {
+      if (qualifier == leftTable.name()) {
+        if (!bind(leftTable, leftRow)) throw runtime_error("unknown column in WHERE: " + predicate.column);
+      } else if (qualifier == rightTable.name()) {
+        if (!bind(rightTable, rightRow)) throw runtime_error("unknown column in WHERE: " + predicate.column);
+      } else {
+        throw runtime_error("unknown table in WHERE: " + qualifier);
+      }
+    } else if (!bind(leftTable, leftRow) && !bind(rightTable, rightRow)) {
+      throw runtime_error("unknown column in WHERE: " + predicate.column);
+    }
+
+    if (row == nullptr) return false;  // NULL side of an outer join
+
+    const auto& actual = (*row)[static_cast<size_t>(colIdx)];
+    const auto& meta = table->columns()[static_cast<size_t>(colIdx)];
+    bool ok = true;
+    if (meta.type == FieldType::Int) {
+      if (!isInteger(predicate.value)) {
+        throw runtime_error("expected INT in predicate for column " + meta.name);
+      }
+      const long long a = stoll(actual);
+      const long long b = stoll(predicate.value);
+      if (predicate.op == "=") ok = a == b;
+      else if (predicate.op == "!=") ok = a != b;
+      else if (predicate.op == "<") ok = a < b;
+      else if (predicate.op == "<=") ok = a <= b;
+      else if (predicate.op == ">") ok = a > b;
+      else if (predicate.op == ">=") ok = a >= b;
+      else throw runtime_error("unknown operator in predicate: " + predicate.op);
+    } else {
+      if (predicate.op == "=") ok = actual == predicate.value;
+      else if (predicate.op == "!=") ok = actual != predicate.value;
+      else if (predicate.op == "<") ok = actual < predicate.value;
+      else if (predicate.op == "<=") ok = actual <= predicate.value;
+      else if (predicate.op == ">") ok = actual > predicate.value;
+      else if (predicate.op == ">=") ok = actual >= predicate.value;
+      else throw runtime_error("unknown operator in predicate: " + predicate.op);
+    }
+    if (!ok) return false;
+  }
+  return true;
+}
+
 string Database::executeJoin(const string& leftTableName, const SelectQuery& query) const {
   const auto& leftTable = table(leftTableName);
   
@@ -312,10 +427,11 @@ string Database::executeJoin(const string& leftTableName, const SelectQuery& que
         if (!rightRows[j].has_value()) continue;
         if (i == 0) rightRowsProcessed++;
         
-        vector<string> row;
         const auto& leftRow = leftRows[i].value();
         const auto& rightRow = rightRows[j].value();
-        
+        if (!joinRowMatches(query.predicates, leftTable, rightTable, &leftRow, &rightRow)) continue;
+
+        vector<string> row;
         if (query.projection.size() == 1 && trim(query.projection[0]) == "*") {
           row.insert(row.end(), leftRow.begin(), leftRow.end());
           row.insert(row.end(), rightRow.begin(), rightRow.end());
@@ -374,7 +490,8 @@ string Database::executeJoin(const string& leftTableName, const SelectQuery& que
           rightRowsProcessed++;
           
           const auto& rightRow = rightRows[rightRowIdx].value();
-          
+          if (!joinRowMatches(query.predicates, leftTable, rightTable, &leftRow, &rightRow)) continue;
+
           vector<string> row;
           if (query.projection.size() == 1 && trim(query.projection[0]) == "*") {
             row.insert(row.end(), leftRow.begin(), leftRow.end());
@@ -409,7 +526,8 @@ string Database::executeJoin(const string& leftTableName, const SelectQuery& que
       }
       
       // Left JOin:
-      if (!foundMatch && (join.type == JoinType::Left || join.type == JoinType::Full)) {
+      if (!foundMatch && (join.type == JoinType::Left || join.type == JoinType::Full) &&
+          joinRowMatches(query.predicates, leftTable, rightTable, &leftRow, nullptr)) {
         vector<string> row;
         if (query.projection.size() == 1 && trim(query.projection[0]) == "*") {
           row.insert(row.end(), leftRow.begin(), leftRow.end());
@@ -447,8 +565,9 @@ string Database::executeJoin(const string& leftTableName, const SelectQuery& que
         if (matchedRightRows.find(j) != matchedRightRows.end()) continue;
         
         const auto& rightRow = rightRows[j].value();
+        if (!joinRowMatches(query.predicates, leftTable, rightTable, nullptr, &rightRow)) continue;
+
         vector<string> row;
-        
         if (query.projection.size() == 1 && trim(query.projection[0]) == "*") {
           for (size_t k = 0; k < leftTable.columns().size(); ++k) {
             row.push_back("NULL");

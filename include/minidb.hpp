@@ -37,12 +37,23 @@ struct Aggregate {
   std::string column;
 };
 
+enum class JoinType { Inner, Left, Right, Full, Cross };
+
+struct JoinClause {
+  std::string rightTable;
+  JoinType type = JoinType::Inner;
+  std::string leftColumn;
+  std::string rightColumn;
+};
+
 struct SelectQuery {
   std::vector<std::string> projection;
+  std::vector<std::string> aliases;
   std::vector<Predicate> predicates;
   std::optional<SortSpec> orderBy;
   std::optional<std::size_t> limit;
   std::optional<Aggregate> aggregate;
+  std::vector<JoinClause> joins;
   bool explainOnly = false;
 };
 
@@ -68,6 +79,8 @@ struct QueryPlan {
 
 class Table {
  public:
+  using Row = std::vector<std::string>;
+  
   Table() = default;
   Table(std::string name, std::vector<Column> columns);
 
@@ -83,12 +96,13 @@ class Table {
   std::string erase(const std::vector<Predicate>& predicates);
   std::string describe() const;
   std::string vacuum();
+  
+  const std::vector<std::optional<Row>>& rows() const { return rows_; }
 
   void save(const std::filesystem::path& dataDir) const;
   static Table load(const std::filesystem::path& schemaPath);
 
  private:
-  using Row = std::vector<std::string>;
 
   std::string tableName_;
   std::vector<Column> columns_;
@@ -115,6 +129,8 @@ class Database {
 
   void load();
   std::string execute(const std::string& sql);
+  
+  const Table& getTable(const std::string& name) const { return table(name); }
 
  private:
   std::filesystem::path dataDir_;
@@ -122,6 +138,7 @@ class Database {
   std::optional<std::unordered_map<std::string, Table>> transactionSnapshot_;
 
   std::string createTable(const std::string& sql);
+  std::string dropTable(const std::string& sql);
   std::string createIndex(const std::string& sql);
   std::string insert(const std::string& sql);
   std::string select(const std::string& sql, bool explainOnly);
@@ -133,6 +150,7 @@ class Database {
   std::string begin();
   std::string commit();
   std::string rollback();
+  std::string executeJoin(const std::string& leftTableName, const SelectQuery& query) const;
 
   void persistIfAutoCommit(const std::string& tableName);
   void persistAll() const;
@@ -143,5 +161,29 @@ class Database {
 
 std::vector<std::string> splitStatements(const std::string& input);
 std::string trim(std::string text);
+
+// Internal helper functions
+std::string lower(std::string text);
+std::string upper(std::string text);
+bool startsWithKeyword(const std::string& sql, const std::string& keyword);
+std::vector<std::string> splitComma(const std::string& text);
+std::vector<std::string> splitAnd(const std::string& text);
+size_t findKeyword(const std::string& text, const std::string& keyword);
+std::string unquote(std::string value);
+bool isInteger(const std::string& value);
+FieldType parseType(const std::string& text);
+std::string typeName(FieldType type);
+IndexKind parseIndexKind(const std::string& text);
+std::string indexKindName(IndexKind kind);
+std::string encode(const std::string& value);
+std::string decode(const std::string& value);
+std::vector<std::string> splitTsv(const std::string& line);
+std::vector<Predicate> parsePredicates(const std::string& text);
+std::optional<Aggregate> parseAggregate(const std::vector<std::string>& projection);
+std::string formatRows(const std::vector<std::string>& headers,
+                      const std::vector<std::vector<std::string>>& rows,
+                      const std::string& plan);
+SelectQuery parseSelectQuery(const std::string& sql, bool explainOnly);
+std::string joinTypeName(JoinType type);
 
 }  // namespace minidb
